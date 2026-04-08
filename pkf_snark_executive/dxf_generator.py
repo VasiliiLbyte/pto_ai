@@ -17,6 +17,7 @@ import io
 import logging
 import math
 import tempfile
+import os
 from datetime import datetime
 from typing import Any
 
@@ -46,32 +47,42 @@ def generate_pole_dxf(
     Returns:
         bytes DXF-файла или None при ошибке.
     """
+    tmp_path: str | None = None
+    tmp_out_path: str | None = None
     try:
         # Сохраняем шаблон во временный файл и читаем
         with tempfile.NamedTemporaryFile(suffix=".dxf", delete=False) as tmp:
             tmp.write(template_bytes)
             tmp_path = tmp.name
 
-        doc = ezdxf.readfile(tmp_path)
-    except Exception as e:
-        logger.error("Ошибка загрузки DXF-шаблона: %s", e)
-        return None
+        try:
+            doc = ezdxf.readfile(tmp_path)
+        except Exception as e:
+            logger.error("Ошибка загрузки DXF-шаблона: %s", e)
+            return None
 
-    try:
-        _fill_template(doc, result, pdata, cfg)
-    except Exception as e:
-        logger.error("Ошибка заполнения шаблона: %s", e)
-        return None
+        try:
+            _fill_template(doc, result, pdata, cfg)
+        except Exception as e:
+            logger.error("Ошибка заполнения шаблона: %s", e)
+            return None
 
-    # Сохраняем в буфер
-    try:
+        # Сохраняем в буфер
         with tempfile.NamedTemporaryFile(suffix=".dxf", delete=False) as tmp_out:
+            tmp_out_path = tmp_out.name
             doc.saveas(tmp_out.name)
             with open(tmp_out.name, "rb") as f:
                 return f.read()
     except Exception as e:
         logger.error("Ошибка сохранения DXF: %s", e)
         return None
+    finally:
+        for path in (tmp_path, tmp_out_path):
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    logger.warning("Не удалось удалить временный файл: %s", path)
 
 
 def _fill_template(
@@ -188,7 +199,7 @@ def _draw_deviation_line(msp, result: dict[str, Any], layers):
     x_proj = result.get("x_project", 0)
     y_proj = result.get("y_project", 0)
 
-    if not x_proj or not y_proj:
+    if x_proj is None or y_proj is None:
         return
 
     # Линия отклонения (в метрах — масштаб чертежа)

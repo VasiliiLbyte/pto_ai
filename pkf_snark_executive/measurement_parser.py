@@ -269,6 +269,10 @@ def match_points_to_poles(
 
     matched: dict[str, list[dict[str, Any]]] = {p["name"]: [] for p in poles if p.get("name")}
 
+    def _has_xy_coords(pole_data: dict[str, Any]) -> bool:
+        """Проверяет наличие координат, не отбрасывая валидные 0.0."""
+        return pole_data.get("x") is not None and pole_data.get("y") is not None
+
     for point in points:
         if point.get("is_station"):
             continue
@@ -286,7 +290,7 @@ def match_points_to_poles(
             best_dist = float("inf")
             best_pole = ""
             for pname, pdata in pole_index.items():
-                if pdata.get("x") and pdata.get("y"):
+                if _has_xy_coords(pdata):
                     pole_pt = Point2D(pdata["x"], pdata["y"])
                     d = distance_2d(pt, pole_pt)
                     if d < best_dist and d < threshold_m:

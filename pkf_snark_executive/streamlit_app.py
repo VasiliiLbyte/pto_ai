@@ -16,9 +16,11 @@ if str(_pkg_root) not in sys.path:
 
 import io
 import json
+import re
 import tempfile
 import zipfile
 from datetime import datetime
+from time import perf_counter
 
 import pandas as pd
 import plotly.express as px
@@ -49,6 +51,7 @@ _DEFAULT_STATE = {
     "deviation_results": None,  # list[DeviationResult]
     "generated_files": None,    # bytes (ZIP)
     "file_stats": None,         # list[dict] — статистика по файлам замеров
+    "last_project_processing_log": None,  # dict: status, elapsed_s, lines
 }
 
 for key, default in _DEFAULT_STATE.items():
@@ -61,6 +64,22 @@ if st.session_state.config is None:
 
 def get_cfg() -> AppConfig:
     return st.session_state.config
+
+
+def _safe_project_slug(name: str) -> str:
+    """Безопасное имя директории проекта."""
+    normalized = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name.strip())
+    normalized = re.sub(r"\s+", "_", normalized)
+    normalized = normalized.strip("._")
+    return normalized or "project"
+
+
+def _safe_upload_name(filename: str) -> str:
+    """Безопасное имя загружаемого файла без traversal."""
+    base_name = Path(filename).name
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", base_name)
+    cleaned = cleaned.strip()
+    return cleaned or "uploaded_file"
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +225,19 @@ def render_new_project():
 
     st.divider()
 
+    last_log = st.session_state.last_project_processing_log
+    if last_log and last_log.get("project_name") == project_name.strip():
+        st.markdown("#### 🧾 Последний лог обработки проекта")
+        status = last_log.get("status", "UNKNOWN")
+        elapsed_s = float(last_log.get("elapsed_s", 0.0))
+        if status == "OK":
+            st.success(f"Статус: {status} • Время: {elapsed_s:.1f} c")
+        elif status == "FAILED":
+            st.error(f"Статус: {status} • Время: {elapsed_s:.1f} c")
+        else:
+            st.info(f"Статус: {status} • Время: {elapsed_s:.1f} c")
+        st.code("\n".join(last_log.get("lines", [])) or "Лог пуст")
+
     if st.button("🚀 Обработать проект", type="primary", use_container_width=True):
         if not project_name.strip():
             st.error("Укажите название проекта")
@@ -221,35 +253,54 @@ def _process_project(name: str, pdf_file, dxf_file):
     """Обработка загруженного проекта: парсинг PDF + DXF."""
     from project_parser import parse_pdf_project, parse_dxf_project, merge_project_data
 
-    progress = st.progress(0, text="Сохранение файлов...")
+    progress = st.progress(0, text="Подготовка обработки...")
+    log_placeholder = st.empty()
+    start_ts = perf_counter()
+    log_lines: list[str] = []
+    st.session_state.last_project_processing_log = None
+
+    def elapsed_s() -> float:
+        return perf_counter() - start_ts
+
+    def log_step(step_text: str, pct: int) -> None:
+        pct_clamped = max(0, min(100, int(pct)))
+        line = f"[+{elapsed_s():.1f}s] [{pct_clamped:>3}%] {step_text}"
+        log_lines.append(line)
+        progress.progress(pct_clamped, text=step_text)
+        log_placeholder.code("\n".join(log_lines))
 
     try:
         # Сохраняем файлы во временную директорию
-        project_dir = DATA_DIR / name.replace(" ", "_")
+        log_step("Подготовка директории проекта...", 5)
+        project_dir = DATA_DIR / _safe_project_slug(name)
         project_dir.mkdir(parents=True, exist_ok=True)
 
         pdf_path = project_dir / "project.pdf"
         pdf_path.write_bytes(pdf_file.getvalue())
-        progress.progress(10, text="PDF сохранён. Парсинг PDF...")
+        log_step("PDF сохранён. Парсинг PDF...", 15)
 
         dxf_path = None
         if dxf_file is not None:
             dxf_path = project_dir / "project.dxf"
             dxf_path.write_bytes(dxf_file.getvalue())
+            log_step("DXF сохранён. Парсинг PDF продолжается...", 20)
 
         # Парсинг PDF
         pdf_data = parse_pdf_project(str(pdf_path), get_cfg())
-        progress.progress(50, text="PDF обработан. Парсинг DXF...")
+        log_step("PDF обработан.", 50)
 
         # Парсинг DXF
         dxf_data = None
         if dxf_path:
+            log_step("Парсинг DXF...", 60)
             dxf_data = parse_dxf_project(str(dxf_path), get_cfg())
-            progress.progress(75, text="DXF обработан. Объединение данных...")
+            log_step("DXF обработан.", 75)
+        else:
+            log_step("DXF не загружен. Этап парсинга DXF пропущен.", 75)
 
         # Объединение
+        log_step("Объединение данных проекта...", 90)
         merged = merge_project_data(pdf_data, dxf_data)
-        progress.progress(90, text="Финализация...")
 
         st.session_state.project_data = {
             "name": name,
@@ -270,7 +321,19 @@ def _process_project(name: str, pdf_file, dxf_file):
             json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
-        progress.progress(100, text="Готово!")
+        log_step("Финализация завершена.", 100)
+        total_elapsed = elapsed_s()
+        log_lines[-1] = (
+            f"[+{total_elapsed:.1f}s] [100%] "
+            f"Финализация завершена (OK). Найдено опор: {len(merged)}"
+        )
+        log_placeholder.code("\n".join(log_lines))
+        st.session_state.last_project_processing_log = {
+            "status": "OK",
+            "elapsed_s": total_elapsed,
+            "project_name": name,
+            "lines": log_lines,
+        }
 
         if not merged:
             st.warning(
@@ -282,6 +345,17 @@ def _process_project(name: str, pdf_file, dxf_file):
         st.rerun()
 
     except Exception as e:
+        total_elapsed = elapsed_s()
+        fail_line = f"[+{total_elapsed:.1f}s] [100%] FAILED: {e}"
+        log_lines.append(fail_line)
+        progress.progress(100, text="Обработка завершилась с ошибкой")
+        log_placeholder.code("\n".join(log_lines))
+        st.session_state.last_project_processing_log = {
+            "status": "FAILED",
+            "elapsed_s": total_elapsed,
+            "project_name": name,
+            "lines": log_lines,
+        }
         st.error(f"Ошибка обработки проекта: {e}")
         import traceback
         st.expander("Подробности ошибки").code(traceback.format_exc())
@@ -343,6 +417,7 @@ def _load_saved_project(pdir: Path, meta: dict):
         "dxf_path": str(dxf_path) if dxf_path.exists() else None,
         "project_dir": str(pdir),
     }
+    st.session_state.last_project_processing_log = None
     st.session_state.project_name = meta.get("name", "")
     st.session_state.current_step = "project_overview"
     st.rerun()
@@ -484,6 +559,11 @@ def _process_measurements(files, pdata):
     cfg = get_cfg()
     poles = pdata["poles"]
     all_points = []
+    max_files = max(1, int(cfg.max_measurement_files))
+    uploaded_count = len(files)
+    files = list(files[:max_files])
+    if uploaded_count > max_files:
+        st.warning(f"Будут обработаны первые {max_files} файлов из {uploaded_count}.")
 
     progress = st.progress(0, text="Парсинг файлов замеров...")
     total = len(files)
@@ -498,13 +578,14 @@ def _process_measurements(files, pdata):
         project_dir = Path(pdata["project_dir"])
         meas_dir = project_dir / "measurements"
         meas_dir.mkdir(exist_ok=True)
-        fpath = meas_dir / f.name
+        safe_name = _safe_upload_name(f.name)
+        fpath = meas_dir / safe_name
         fpath.write_bytes(f.getvalue())
 
         points = parse_measurement_file(str(fpath))
         all_points.extend(points)
         file_stats.append({
-            "Файл": f.name,
+            "Файл": safe_name,
             "Точек": len(points),
             "Опор распознано": len(set(p.get("pole_id", "") for p in points if p.get("pole_id"))),
         })
@@ -558,16 +639,22 @@ def _render_deviation_table():
     available_cols = [c for c in display_cols if c in df.columns]
     df_display = df[available_cols].rename(columns=display_cols)
 
-    st.dataframe(
-        df_display.style.applymap(
+    styler = df_display.style
+    status_subset = ["Статус"] if "Статус" in df_display.columns else []
+    if status_subset:
+        # pandas>=3: applymap removed on Styler; use map for elementwise styling.
+        styler = styler.map(
             lambda v: (
                 "background-color: #d4edda" if v == "Норма"
                 else "background-color: #fff3cd" if v == "Предупреждение"
                 else "background-color: #f8d7da" if v == "Превышение"
                 else ""
             ),
-            subset=["Статус"] if "Статус" in df_display.columns else [],
-        ),
+            subset=status_subset,
+        )
+
+    st.dataframe(
+        styler,
         use_container_width=True,
         height=500,
     )

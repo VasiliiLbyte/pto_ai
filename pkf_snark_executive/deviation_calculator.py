@@ -68,7 +68,7 @@ def calculate_single_deviation(
             pole_name, len(lower), len(upper),
         )
         # Если есть хотя бы 2 точки — используем проектный центр как нижний
-        if len(points) >= 2 and pole.get("x") and pole.get("y"):
+        if len(points) >= 2 and pole.get("x") is not None and pole.get("y") is not None:
             return _calculate_from_project_center(pole, points, cfg)
         return None
 
