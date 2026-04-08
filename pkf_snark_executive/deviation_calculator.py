@@ -23,7 +23,7 @@ import statistics
 from typing import Any
 
 from config import AppConfig
-from measurement_parser import classify_pole_points
+from measurement_parser import classify_pole_points, trim_pole_points_for_verticality
 from utils.geometry import (
     Point2D,
     Point3D,
@@ -154,6 +154,12 @@ def calculate_single_deviation(
             "После фильтрации выбросов недостаточно точек для расчёта.",
             "; ".join(quality_notes) if quality_notes else None,
         )
+
+    lower_n = max(1, int(getattr(cfg, "pole_belt_lower_count", 3)))
+    upper_n = max(1, int(getattr(cfg, "pole_belt_upper_count", 3)))
+    points, trim_note = trim_pole_points_for_verticality(points, lower_n, upper_n)
+    if trim_note:
+        quality_notes.append(trim_note)
 
     z_values = [float(p.get("z", 0.0)) for p in points]
     z_span = max(z_values) - min(z_values) if z_values else 0.0

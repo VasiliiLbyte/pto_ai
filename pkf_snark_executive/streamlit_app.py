@@ -246,6 +246,38 @@ def render_sidebar():
             stamp.surveyor = st.text_input("Геодезист", value=stamp.surveyor, key="stamp_surv")
             stamp.checker = st.text_input("Проверил", value=stamp.checker, key="stamp_check")
             stamp.chief_engineer = st.text_input("ГИП", value=stamp.chief_engineer, key="stamp_gip")
+            prev_swap_mode = get_cfg().swap_measurement_xy
+            get_cfg().swap_measurement_xy = st.checkbox(
+                "Поменять X/Y у замеров",
+                value=get_cfg().swap_measurement_xy,
+                help="Дополнительная перестановка уже прочитанных X и Y. Обычно достаточно выбрать порядок колонок TXT ниже.",
+                key="swap_measurement_xy_checkbox",
+            )
+            prev_txt_order = getattr(get_cfg(), "measurement_txt_coord_order", "xy")
+            txt_order_label = st.selectbox(
+                "TXT: порядок координат после имени точки",
+                options=("xy", "yx"),
+                format_func=lambda v: (
+                    "X, Y, Z — как в README (2-я X, 3-я Y)"
+                    if v == "xy"
+                    else "Y, X, Z — сначала Y, потом X (многие выгрузки)"
+                ),
+                index=0 if prev_txt_order != "yx" else 1,
+                key="measurement_txt_coord_order_select",
+                help="Для файлов вида «574.3, 74156.xxx, 119387.xxx, Z» выберите Y, X, Z.",
+            )
+            get_cfg().measurement_txt_coord_order = txt_order_label
+
+            settings_changed = (
+                prev_swap_mode != get_cfg().swap_measurement_xy
+                or prev_txt_order != get_cfg().measurement_txt_coord_order
+            )
+            if settings_changed:
+                st.session_state.measurement_data = None
+                st.session_state.deviation_results = None
+                st.session_state.file_stats = None
+                st.session_state.generated_files = None
+                st.info("Настройки замеров изменены. Перезапустите обработку замеров для пересчёта результатов.")
 
         st.divider()
 
@@ -791,13 +823,28 @@ def _process_measurements(files, pdata):
         fpath = meas_dir / safe_name
         fpath.write_bytes(f.getvalue())
 
-        points = parse_measurement_file(str(fpath))
+        points = parse_measurement_file(
+            str(fpath),
+            txt_coord_order=getattr(cfg, "measurement_txt_coord_order", "xy") or "xy",
+            app_cfg=cfg,
+        )
+        if cfg.swap_measurement_xy:
+            transformed_points: list[dict] = []
+            for p in points:
+                if "x" in p and "y" in p:
+                    transformed_points.append({**p, "x": p["y"], "y": p["x"]})
+                else:
+                    transformed_points.append(dict(p))
+            points = transformed_points
         all_points.extend(points)
         file_stats.append({
             "Файл": safe_name,
             "Точек": len(points),
             "Опор распознано": len(set(p.get("pole_id", "") for p in points if p.get("pole_id"))),
         })
+
+    if cfg.swap_measurement_xy:
+        st.info("Применена перестановка осей X/Y для загруженных замеров.")
 
     # Статистика по файлам
     st.subheader("📁 Загруженные файлы")

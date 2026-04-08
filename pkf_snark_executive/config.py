@@ -170,11 +170,27 @@ class AppConfig:
     # Порог привязки точек к опорам (м)
     match_radius_m: float = 2.0
 
+    # Перестановка осей X/Y для файлов замеров (когда источник хранит N/E вместо E/N)
+    swap_measurement_xy: bool = False
+
+    # Порядок координат в TXT после имени точки: «xy» = X,Y,Z; «yx» = Y,X,Z (частая выгрузка)
+    measurement_txt_coord_order: str = "xy"
+
     # Максимальное количество файлов замеров
     max_measurement_files: int = 10
 
     # Ограничение страниц для LLM-парсинга PDF за один проход
     max_llm_pages: int = 12
+
+    # DXF замеров: вставки блока с подписью номера точки (типично Trimble/Civil)
+    dxf_measurement_block_name: str = "Measured"
+    dxf_measurement_label_layer: str = "Nomer"
+    # Радиус поиска подписи от вставки (м)
+    dxf_measurement_label_radius_m: float = 0.15
+
+    # Сколько точек нижнего/верхнего пояса оставлять при избытке съёмок
+    pole_belt_lower_count: int = 3
+    pole_belt_upper_count: int = 3
 
 
 def get_config() -> AppConfig:

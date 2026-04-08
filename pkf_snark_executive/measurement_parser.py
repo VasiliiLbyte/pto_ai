@@ -2,8 +2,9 @@
 Парсер геодезических замеров (TXT, DXF, XML).
 
 Поддерживаемые форматы:
-- TXT: CSV без заголовка «ИмяТочки,X,Y,Z» (формат FL573A-579.593-4.txt)
-- DXF: POINT + TEXT из файлов замеров
+- TXT: CSV без заголовка; по умолчанию «Имя,X,Y,Z», опционально «Имя,Y,X,Z»
+  (см. measurement_txt_coord_order / настройки замеров)
+- DXF: POINT + TEXT; либо INSERT блока (напр. Measured) + TEXT на слое с номером точки (Nomer)
 - XML: Leica/Trimble форматы
 
 Привязка точек к опорам:
@@ -16,11 +17,14 @@ import logging
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import ezdxf
 
 from utils.geometry import Point2D, Point3D, distance_2d
+
+if TYPE_CHECKING:
+    from config import AppConfig
 
 logger = logging.getLogger(__name__)
 
@@ -28,18 +32,28 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Универсальный диспетчер
 # ---------------------------------------------------------------------------
-def parse_measurement_file(file_path: str) -> list[dict[str, Any]]:
+def parse_measurement_file(
+    file_path: str,
+    *,
+    txt_coord_order: str = "xy",
+    app_cfg: "AppConfig | None" = None,
+) -> list[dict[str, Any]]:
     """
     Парсит файл замеров, определяя формат по расширению.
+
+    Args:
+        file_path: путь к файлу
+        txt_coord_order: для .txt — «xy» (колонки X,Y,Z) или «yx» (Y,X,Z после имени)
+        app_cfg: для .dxf — имена блока/слоя и порог подписи
 
     Returns:
         Список точек: [{name, x, y, z, pole_id, point_suffix, is_station}, ...]
     """
     ext = Path(file_path).suffix.lower()
     if ext == ".txt":
-        return parse_txt_measurements(file_path)
+        return parse_txt_measurements(file_path, coord_order=txt_coord_order)
     elif ext == ".dxf":
-        return parse_dxf_measurements(file_path)
+        return parse_dxf_measurements(file_path, cfg=app_cfg)
     elif ext == ".xml":
         return parse_xml_measurements(file_path)
     else:
@@ -56,14 +70,23 @@ _POLE_POINT_RE = re.compile(r'^(\d{1,4}[A-Za-zА-Яа-я]?)\.(\d+)$')
 _STATION_RE = re.compile(r'^\d+\s*\(\d+\)$')
 
 
-def parse_txt_measurements(file_path: str) -> list[dict[str, Any]]:
+def parse_txt_measurements(
+    file_path: str,
+    coord_order: str = "xy",
+) -> list[dict[str, Any]]:
     """
     Парсит TXT-файл замеров (CSV без заголовка).
 
-    Формат строки: ИмяТочки,X,Y,Z
+    Формат строки (coord_order «xy»): ИмяТочки,X,Y,Z
     Пример: 573A.3,74204.183,119389.735,22.087
+
+    Формат (coord_order «yx»): ИмяТочки,Y,X,Z — сначала северная/широтная, потом восточная
+    (типично для части выгрузок с тахеометра).
     """
     points: list[dict[str, Any]] = []
+    order = (coord_order or "xy").strip().lower()
+    if order not in ("xy", "yx"):
+        order = "xy"
 
     with open(file_path, "r", encoding="utf-8", errors="replace") as f:
         for line_no, line in enumerate(f, 1):
@@ -81,9 +104,13 @@ def parse_txt_measurements(file_path: str) -> list[dict[str, Any]]:
 
             name = parts[0].strip()
             try:
-                x = float(parts[1].strip().replace(",", "."))
-                y = float(parts[2].strip().replace(",", "."))
+                c1 = float(parts[1].strip().replace(",", "."))
+                c2 = float(parts[2].strip().replace(",", "."))
                 z = float(parts[3].strip().replace(",", "."))
+                if order == "yx":
+                    y, x = c1, c2
+                else:
+                    x, y = c1, c2
             except ValueError:
                 logger.debug("Строка %d: ошибка числового формата: %s", line_no, line)
                 continue
@@ -130,8 +157,74 @@ def _classify_point(name: str, x: float, y: float, z: float) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # DXF парсер замеров
 # ---------------------------------------------------------------------------
-def parse_dxf_measurements(file_path: str) -> list[dict[str, Any]]:
-    """Парсит DXF-файл замеров (POINT + TEXT рядом)."""
+def _parse_dxf_measured_inserts(
+    msp: Any,
+    block_name: str,
+    label_layer: str,
+    match_radius_m: float,
+) -> list[dict[str, Any]]:
+    """
+    Точки из INSERT блока (например Trimble: блок «Measured»), координаты — точка вставки;
+    подпись номера — на слое label_layer (TEXT/MTEXT рядом с вставкой).
+    """
+    points: list[dict[str, Any]] = []
+    layer_q = label_layer.replace('"', '\\"')
+    try:
+        label_texts = list(msp.query(f'TEXT[layer=="{layer_q}"]'))
+    except Exception:
+        label_texts = []
+    try:
+        label_texts.extend(msp.query(f'MTEXT[layer=="{layer_q}"]'))
+    except Exception:
+        pass
+
+    def _text_pos(ent: Any) -> Point3D:
+        if ent.dxftype() == "MTEXT":
+            return Point3D(ent.dxf.insert.x, ent.dxf.insert.y, ent.dxf.insert.z)
+        return Point3D(ent.dxf.insert.x, ent.dxf.insert.y, ent.dxf.insert.z)
+
+    def _text_content(ent: Any) -> str:
+        if ent.dxftype() == "MTEXT":
+            try:
+                return ent.plain_text().strip()
+            except Exception:
+                return (getattr(ent, "text", "") or "").strip()
+        return (ent.dxf.text or "").strip()
+
+    for entity in msp.query("INSERT"):
+        if (entity.dxf.name or "") != block_name:
+            continue
+        ins = entity.dxf.insert
+        ix, iy, iz = float(ins.x), float(ins.y), float(ins.z)
+        ins_pt = Point3D(ix, iy, iz)
+
+        best_dist = float("inf")
+        best_name = ""
+        for t_ent in label_texts:
+            tpos = _text_pos(t_ent)
+            d = distance_2d(ins_pt, tpos)
+            if d < best_dist and d <= match_radius_m:
+                best_dist = d
+                best_name = _text_content(t_ent)
+
+        name = best_name or f"P_{ix:.1f}_{iy:.1f}"
+        points.append(_classify_point(name, ix, iy, iz))
+
+    return points
+
+
+def parse_dxf_measurements(
+    file_path: str,
+    cfg: "AppConfig | None" = None,
+) -> list[dict[str, Any]]:
+    """Парсит DXF-файл замеров: INSERT+подпись (приоритет) или POINT + TEXT."""
+    from config import AppConfig
+
+    c = cfg or AppConfig()
+    block_name = getattr(c, "dxf_measurement_block_name", "Measured") or "Measured"
+    label_layer = getattr(c, "dxf_measurement_label_layer", "Nomer") or "Nomer"
+    match_r = float(getattr(c, "dxf_measurement_label_radius_m", 0.15) or 0.15)
+
     points: list[dict[str, Any]] = []
 
     try:
@@ -142,13 +235,23 @@ def parse_dxf_measurements(file_path: str) -> list[dict[str, Any]]:
 
     msp = doc.modelspace()
 
-    # Собираем все POINT
+    measured = _parse_dxf_measured_inserts(msp, block_name, label_layer, match_r)
+    if measured:
+        logger.info(
+            "DXF: INSERT «%s» + слой «%s»: %d точек из %s",
+            block_name,
+            label_layer,
+            len(measured),
+            file_path,
+        )
+        return measured
+
+    # Fallback: классическая схема POINT + TEXT
     dxf_points: list[Point3D] = []
     for entity in msp.query("POINT"):
         loc = entity.dxf.location
         dxf_points.append(Point3D(loc.x, loc.y, loc.z))
 
-    # Собираем все TEXT
     texts: list[tuple[Point3D, str]] = []
     for entity in msp.query("TEXT"):
         pos = entity.dxf.insert
@@ -156,7 +259,6 @@ def parse_dxf_measurements(file_path: str) -> list[dict[str, Any]]:
         if text:
             texts.append((Point3D(pos.x, pos.y, pos.z), text))
 
-    # Сопоставляем POINT + TEXT (ближайший текст < 3 м)
     for pt in dxf_points:
         best_dist = float("inf")
         best_name = ""
@@ -167,10 +269,9 @@ def parse_dxf_measurements(file_path: str) -> list[dict[str, Any]]:
                 best_name = tname
 
         name = best_name or f"P_{pt.x:.1f}_{pt.y:.1f}"
-        point = _classify_point(name, pt.x, pt.y, pt.z)
-        points.append(point)
+        points.append(_classify_point(name, pt.x, pt.y, pt.z))
 
-    logger.info("DXF замеры: прочитано %d точек из %s", len(points), file_path)
+    logger.info("DXF замеры (POINT+TEXT): прочитано %d точек из %s", len(points), file_path)
     return points
 
 
@@ -312,6 +413,38 @@ def match_points_to_poles(
     return matched
 
 
+def trim_pole_points_for_verticality(
+    points: list[dict[str, Any]],
+    lower_n: int,
+    upper_n: int,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """
+    Если на опоре больше точек, чем lower_n + upper_n, оставляет lower_n с минимальным Z
+    и upper_n с максимальным Z (промежуточные повторы/лишние съёмки отбрасываются).
+    """
+    need = lower_n + upper_n
+    if len(points) <= need:
+        return list(points), None
+
+    indexed = list(enumerate(points))
+    sorted_by_z = sorted(
+        indexed,
+        key=lambda t: float(t[1].get("z", 0.0)),
+    )
+    keep_idx: set[int] = set()
+    for i in range(lower_n):
+        keep_idx.add(sorted_by_z[i][0])
+    for i in range(upper_n):
+        keep_idx.add(sorted_by_z[-(i + 1)][0])
+
+    trimmed = [points[i] for i in sorted(keep_idx)]
+    note = (
+        f"Отобрано {need} из {len(points)} точек: {lower_n} с минимальным Z и {upper_n} с максимальным Z "
+        "(промежуточные съёмки исключены)."
+    )
+    return trimmed, note
+
+
 def classify_pole_points(
     points: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -319,13 +452,26 @@ def classify_pole_points(
     Разделяет точки опоры на нижние и верхние.
 
     Стратегия:
-    - Если суффиксы .1 — нижние, .2/.3 — верхние
+    - Ровно 6 точек: 3 с минимальным Z (низ) и 3 с максимальным Z (верх)
+    - Если суффиксы .1 — нижние, .2/.3 — верхние (до 3 точек по суффиксам)
     - Если суффиксов нет — по Z: нижняя половина / верхняя половина
-    - Если 3 точки — .1 нижняя, .2/.3 верхние (для 2-уровневой съёмки)
-    - Если 6 точек — .1/.2/.3 нижние, .4/.5/.6 верхние
+    - Если 3 точки — .1 нижняя, .2/.3 верхние
+    - Если 6+ точек с суффиксами — по номеру суффикса (половина / половина)
     """
     if not points:
         return [], []
+
+    if len(points) == 6:
+        sorted_pts = sorted(
+            points,
+            key=lambda p: (
+                float(p.get("z", 0.0)),
+                int(p["point_suffix"])
+                if str(p.get("point_suffix", "")).isdigit()
+                else 0,
+            ),
+        )
+        return sorted_pts[:3], sorted_pts[3:]
 
     suffixes = [p.get("point_suffix", "") for p in points]
     has_suffixes = any(s for s in suffixes)
