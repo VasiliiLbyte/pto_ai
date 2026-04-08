@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import math
+import statistics
 from typing import Any
 
 from config import AppConfig
@@ -33,6 +34,77 @@ from utils.geometry import (
 from utils.gost_checker import DeviationStatus, check_tolerance
 
 logger = logging.getLogger(__name__)
+
+MIN_VERTICAL_SPAN_M = 0.05
+OUTLIER_ABS_THRESHOLD_M = 20.0
+OUTLIER_RATIO_THRESHOLD = 5.0
+
+
+def _insufficient_data_result(
+    pole: dict[str, Any],
+    points: list[dict[str, Any]],
+    reason: str,
+    quality_note: str | None = None,
+) -> dict[str, Any]:
+    """Возвращает строку результата с явной пометкой недостаточности данных."""
+    pole_name = pole.get("name", "?")
+    pole_type = pole.get("type", "DEFAULT")
+    pole_height = pole.get("height", 0.0) or 10.0
+    avg_x = sum(p["x"] for p in points) / len(points) if points else pole.get("x", 0.0)
+    avg_y = sum(p["y"] for p in points) / len(points) if points else pole.get("y", 0.0)
+    avg_z = sum(p["z"] for p in points) / len(points) if points else 0.0
+    note = quality_note or reason
+    return {
+        "pole_name": pole_name,
+        "pole_type": pole_type,
+        "height_project": pole_height,
+        "height_fact": round(avg_z, 3),
+        "x_project": pole.get("x", 0.0),
+        "y_project": pole.get("y", 0.0),
+        "x_fact_low": round(avg_x, 3),
+        "y_fact_low": round(avg_y, 3),
+        "x_fact_high": round(avg_x, 3),
+        "y_fact_high": round(avg_y, 3),
+        "dx_mm": None,
+        "dy_mm": None,
+        "deviation_mm": None,
+        "angle_deg": None,
+        "tolerance_mm": None,
+        "status": "Недостаточно данных",
+        "status_detail": reason,
+        "quality_note": note,
+        "n_lower": 0,
+        "n_upper": len(points),
+    }
+
+
+def _filter_single_extreme_outlier(points: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
+    """Удаляет один явный выброс по XY, если он значительно дальше остальных."""
+    if len(points) < 4:
+        return points, []
+
+    xs = [p["x"] for p in points]
+    ys = [p["y"] for p in points]
+    center_x = statistics.median(xs)
+    center_y = statistics.median(ys)
+
+    distances: list[tuple[int, float]] = []
+    for idx, p in enumerate(points):
+        d = math.hypot(p["x"] - center_x, p["y"] - center_y)
+        distances.append((idx, d))
+
+    distances.sort(key=lambda t: t[1], reverse=True)
+    far_idx, far_dist = distances[0]
+    second_dist = distances[1][1] if len(distances) > 1 else 0.0
+    is_extreme = far_dist > OUTLIER_ABS_THRESHOLD_M and (
+        second_dist == 0 or far_dist / max(second_dist, 1e-9) >= OUTLIER_RATIO_THRESHOLD
+    )
+    if not is_extreme:
+        return points, []
+
+    removed_name = points[far_idx].get("name", f"idx_{far_idx}")
+    filtered = [p for i, p in enumerate(points) if i != far_idx]
+    return filtered, [removed_name]
 
 
 def calculate_single_deviation(
@@ -54,10 +126,47 @@ def calculate_single_deviation(
     pole_name = pole.get("name", "?")
     pole_type = pole.get("type", "DEFAULT")
     pole_height = pole.get("height", 0.0) or 10.0  # fallback
+    quality_notes: list[str] = []
 
     if len(points) < 2:
         logger.warning("Опора %s: менее 2 точек (%d), пропуск", pole_name, len(points))
-        return None
+        return _insufficient_data_result(
+            pole,
+            points,
+            "Недостаточно точек для расчёта вертикальности (нужно минимум 2).",
+        )
+
+    filtered_points, removed_outliers = _filter_single_extreme_outlier(points)
+    if removed_outliers:
+        lower_tmp, upper_tmp = classify_pole_points(filtered_points)
+        if lower_tmp and upper_tmp:
+            quality_notes.append(f"Исключён выброс: {', '.join(removed_outliers)}")
+            points = filtered_points
+        else:
+            quality_notes.append(
+                f"Кандидат выброса не удалён (нарушилось деление низ/верх): "
+                f"{', '.join(removed_outliers)}"
+            )
+    if len(points) < 2:
+        return _insufficient_data_result(
+            pole,
+            points,
+            "После фильтрации выбросов недостаточно точек для расчёта.",
+            "; ".join(quality_notes) if quality_notes else None,
+        )
+
+    z_values = [float(p.get("z", 0.0)) for p in points]
+    z_span = max(z_values) - min(z_values) if z_values else 0.0
+    if z_span < MIN_VERTICAL_SPAN_M:
+        quality_notes.append(
+            f"Малый разброс Z ({z_span:.3f} м): нет уверенного разделения низ/верх."
+        )
+        return _insufficient_data_result(
+            pole,
+            points,
+            "Недостаточно вертикального разнесения точек для расчёта вертикальности.",
+            "; ".join(quality_notes),
+        )
 
     # Разделяем на нижние и верхние
     lower, upper = classify_pole_points(points)
@@ -110,6 +219,7 @@ def calculate_single_deviation(
         "tolerance_mm": round(tolerance_result.tolerance_mm, 1),
         "status": tolerance_result.status.value,
         "status_detail": tolerance_result.status_text,
+        "quality_note": "; ".join(quality_notes) if quality_notes else "",
         "n_lower": len(lower),
         "n_upper": len(upper),
     }
@@ -160,6 +270,7 @@ def _calculate_from_project_center(
         "tolerance_mm": round(tolerance_result.tolerance_mm, 1),
         "status": tolerance_result.status.value,
         "status_detail": tolerance_result.status_text,
+        "quality_note": "Fallback: нижний центр взят из проекта",
         "n_lower": 0,
         "n_upper": len(points),
     }

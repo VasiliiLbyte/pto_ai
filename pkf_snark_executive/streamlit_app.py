@@ -629,12 +629,19 @@ def _render_deviation_table():
         "pole_type": "Тип",
         "height_project": "Высота проект (м)",
         "height_fact": "Высота факт (м)",
+        "x_project": "X проект",
+        "y_project": "Y проект",
+        "x_fact_low": "X факт (низ)",
+        "y_fact_low": "Y факт (низ)",
+        "x_fact_high": "X факт (верх)",
+        "y_fact_high": "Y факт (верх)",
         "dx_mm": "ΔX (мм)",
         "dy_mm": "ΔY (мм)",
         "deviation_mm": "Отклонение (мм)",
         "angle_deg": "Угол (°)",
         "tolerance_mm": "Допуск (мм)",
         "status": "Статус",
+        "quality_note": "Качество данных",
     }
     available_cols = [c for c in display_cols if c in df.columns]
     df_display = df[available_cols].rename(columns=display_cols)
