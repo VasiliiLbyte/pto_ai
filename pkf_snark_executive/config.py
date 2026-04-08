@@ -22,6 +22,30 @@ DATA_DIR = BASE_DIR / "data" / "projects"
 TEMPLATES_DIR = BASE_DIR / "templates"
 ASSETS_DIR = BASE_DIR / "assets"
 
+MODEL_PDF_PARSING = "google/gemini-2.5-pro"
+
+
+def _load_api_key_from_env_file() -> str:
+    """
+    Читает OPENROUTER_API_KEY из локального .env без внешних зависимостей.
+    """
+    env_path = BASE_DIR / ".env"
+    if not env_path.exists():
+        return ""
+    try:
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            if key.strip() == "OPENROUTER_API_KEY":
+                cleaned = value.strip().strip('"').strip("'")
+                if cleaned:
+                    return cleaned
+    except Exception:
+        return ""
+    return ""
+
 
 # ---------------------------------------------------------------------------
 # OpenRouter API
@@ -29,9 +53,11 @@ ASSETS_DIR = BASE_DIR / "assets"
 @dataclass
 class OpenRouterConfig:
     """Настройки доступа к OpenRouter API."""
-    api_key: str = field(default_factory=lambda: os.getenv("OPENROUTER_API_KEY", ""))
+    api_key: str = field(
+        default_factory=lambda: os.getenv("OPENROUTER_API_KEY", "") or _load_api_key_from_env_file()
+    )
     base_url: str = "https://openrouter.ai/api/v1"
-    model_pdf_parse: str = "google/gemini-2.5-pro-preview-03-25"
+    model_pdf_parse: str = MODEL_PDF_PARSING
     model_code: str = "deepseek/deepseek-r1"
     max_tokens: int = 4096
     temperature: float = 0.1
@@ -146,6 +172,9 @@ class AppConfig:
 
     # Максимальное количество файлов замеров
     max_measurement_files: int = 10
+
+    # Ограничение страниц для LLM-парсинга PDF за один проход
+    max_llm_pages: int = 12
 
 
 def get_config() -> AppConfig:

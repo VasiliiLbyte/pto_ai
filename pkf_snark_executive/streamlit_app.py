@@ -17,6 +17,7 @@ if str(_pkg_root) not in sys.path:
 import io
 import json
 import re
+import shutil
 import tempfile
 import zipfile
 from datetime import datetime
@@ -80,6 +81,89 @@ def _safe_upload_name(filename: str) -> str:
     cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", base_name)
     cleaned = cleaned.strip()
     return cleaned or "uploaded_file"
+
+
+def _load_parsed_project_artifacts(project_dir: Path) -> list[dict] | None:
+    """
+    Загружает опоры из сохранённых артефактов парсинга (primary source).
+    """
+    parsed_json = project_dir / "parsed_data.json"
+    poles_csv = project_dir / "poles.csv"
+
+    def _safe_float(value, default: float = 0.0) -> float:
+        try:
+            if value is None or pd.isna(value):
+                return default
+            if isinstance(value, str):
+                value = value.strip().replace(",", ".")
+            return float(value)
+        except Exception:
+            return default
+
+    def _normalize_row(row: dict) -> dict:
+        embedded_raw = row.get("embedded_parts", [])
+        if isinstance(embedded_raw, str):
+            try:
+                embedded_parts = json.loads(embedded_raw)
+            except Exception:
+                embedded_parts = [embedded_raw] if embedded_raw.strip() else []
+        elif isinstance(embedded_raw, list):
+            embedded_parts = embedded_raw
+        else:
+            embedded_parts = []
+        return {
+            "name": str(row.get("name", "") or "").strip(),
+            "type": str(row.get("type", "") or "").strip(),
+            "height": _safe_float(row.get("height"), 0.0),
+            "x": _safe_float(row.get("x"), 0.0),
+            "y": _safe_float(row.get("y"), 0.0),
+            "z": _safe_float(row.get("z"), 0.0),
+            "source": str(row.get("source", "llm_saved") or "llm_saved").strip(),
+            "foundation": str(row.get("foundation", "") or "").strip(),
+            "embedded_parts": embedded_parts,
+        }
+
+    try:
+        if parsed_json.exists():
+            payload = json.loads(parsed_json.read_text(encoding="utf-8"))
+            poles = payload.get("poles", [])
+            if isinstance(poles, list) and poles:
+                return [_normalize_row(p) for p in poles if isinstance(p, dict)]
+    except Exception as e:
+        st.warning(f"Не удалось прочитать parsed_data.json: {e}")
+
+    try:
+        if poles_csv.exists():
+            df = pd.read_csv(poles_csv)
+            if not df.empty:
+                records = df.to_dict("records")
+                return [_normalize_row(r) for r in records]
+    except Exception as e:
+        st.warning(f"Не удалось прочитать poles.csv: {e}")
+
+    return None
+
+
+def _show_action_hint(title: str, details: str = "Пожалуйста, дождитесь завершения. Не закрывайте страницу.") -> None:
+    """Единый информационный блок перед длительными действиями."""
+    with st.status(title, expanded=False) as status:
+        st.write(details)
+        status.update(label=title, state="running")
+
+
+def _delete_project(pdir: Path) -> tuple[bool, str]:
+    """Безопасно удаляет каталог проекта внутри DATA_DIR."""
+    try:
+        resolved_data_dir = DATA_DIR.resolve()
+        resolved_target = pdir.resolve()
+        if resolved_data_dir not in resolved_target.parents:
+            return False, "Неверный путь проекта."
+        if not resolved_target.exists() or not resolved_target.is_dir():
+            return False, "Проект уже удалён или недоступен."
+        shutil.rmtree(resolved_target)
+        return True, "Проект удалён."
+    except Exception as e:
+        return False, f"Ошибка удаления: {e}"
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +335,12 @@ def render_new_project():
 
 def _process_project(name: str, pdf_file, dxf_file):
     """Обработка загруженного проекта: парсинг PDF + DXF."""
-    from project_parser import parse_pdf_project, parse_dxf_project, merge_project_data
+    from project_parser import (
+        parse_dxf_project,
+        parse_pdf_project,
+        parse_pdf_with_llm,
+        merge_project_data,
+    )
 
     progress = st.progress(0, text="Подготовка обработки...")
     log_placeholder = st.empty()
@@ -285,9 +374,26 @@ def _process_project(name: str, pdf_file, dxf_file):
             dxf_path.write_bytes(dxf_file.getvalue())
             log_step("DXF сохранён. Парсинг PDF продолжается...", 20)
 
-        # Парсинг PDF
-        pdf_data = parse_pdf_project(str(pdf_path), get_cfg())
-        log_step("PDF обработан.", 50)
+        # Парсинг PDF через LLM (primary) с fallback на текущий парсер.
+        log_step("Парсинг PDF через Gemini...", 30)
+        llm_payload: dict | None = None
+        pdf_data: list[dict] = []
+        used_llm = False
+        try:
+            llm_payload = parse_pdf_with_llm(str(pdf_path), _safe_project_slug(name))
+            pdf_data = llm_payload.get("poles", []) if llm_payload else []
+            if pdf_data:
+                used_llm = True
+                log_step("LLM-парсинг PDF завершён.", 50)
+            else:
+                log_step("LLM не вернул данные. Запуск fallback-парсинга PDF...", 42)
+                pdf_data = parse_pdf_project(str(pdf_path), get_cfg())
+                log_step("Fallback-парсинг PDF завершён.", 50)
+        except Exception as e:
+            log_step("Ошибка LLM-парсинга. Запуск fallback-парсинга PDF...", 42)
+            st.warning(f"LLM-парсинг не выполнен: {e}")
+            pdf_data = parse_pdf_project(str(pdf_path), get_cfg())
+            log_step("Fallback-парсинг PDF завершён.", 50)
 
         # Парсинг DXF
         dxf_data = None
@@ -308,6 +414,7 @@ def _process_project(name: str, pdf_file, dxf_file):
             "pdf_path": str(pdf_path),
             "dxf_path": str(dxf_path) if dxf_path else None,
             "project_dir": str(project_dir),
+            "llm_parsed": used_llm,
         }
 
         # Сохраняем метаданные
@@ -387,7 +494,7 @@ def render_saved_projects():
             continue
 
         with st.container(border=True):
-            col1, col2, col3 = st.columns([3, 2, 1])
+            col1, col2, col3, col4 = st.columns([3, 2, 1, 1])
             with col1:
                 st.markdown(f"**{meta.get('name', pdir.name)}**")
                 st.caption(f"Создан: {meta.get('created', '?')[:10]}")
@@ -396,31 +503,101 @@ def render_saved_projects():
             with col3:
                 if st.button("Открыть", key=f"open_{pdir.name}"):
                     _load_saved_project(pdir, meta)
+            with col4:
+                confirm_key = f"confirm_delete_{pdir.name}"
+                if st.session_state.get(confirm_key, False):
+                    if st.button("Подтвердить", key=f"confirm_btn_{pdir.name}", type="primary"):
+                        ok, msg = _delete_project(pdir)
+                        if ok:
+                            active = st.session_state.project_data or {}
+                            if str(active.get("project_dir", "")) == str(pdir):
+                                st.session_state.project_data = None
+                                st.session_state.measurement_data = None
+                                st.session_state.deviation_results = None
+                                st.session_state.generated_files = None
+                                st.session_state.file_stats = None
+                                st.session_state.current_step = "saved_projects"
+                            st.session_state[confirm_key] = False
+                            st.success(msg)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+                    if st.button("Отмена", key=f"cancel_btn_{pdir.name}"):
+                        st.session_state[confirm_key] = False
+                        st.rerun()
+                elif st.button("Удалить", key=f"delete_{pdir.name}"):
+                    st.session_state[confirm_key] = True
+                    st.warning("Нажмите «Подтвердить» для удаления проекта.")
+                    st.rerun()
 
 
 def _load_saved_project(pdir: Path, meta: dict):
     """Загружает ранее сохранённый проект."""
-    from project_parser import parse_pdf_project, parse_dxf_project, merge_project_data
+    from project_parser import parse_dxf_project, parse_pdf_project, merge_project_data
 
     pdf_path = pdir / "project.pdf"
     dxf_path = pdir / "project.dxf"
+    progress = st.progress(0, text="Открытие проекта...")
+    log_placeholder = st.empty()
+    start_ts = perf_counter()
+    log_lines: list[str] = []
 
-    pdf_data = parse_pdf_project(str(pdf_path), get_cfg()) if pdf_path.exists() else []
-    dxf_data = parse_dxf_project(str(dxf_path), get_cfg()) if dxf_path.exists() else None
+    def elapsed_s() -> float:
+        return perf_counter() - start_ts
 
-    merged = merge_project_data(pdf_data, dxf_data)
+    def log_step(step_text: str, pct: int) -> None:
+        pct_clamped = max(0, min(100, int(pct)))
+        line = f"[+{elapsed_s():.1f}s] [{pct_clamped:>3}%] {step_text}"
+        log_lines.append(line)
+        progress.progress(pct_clamped, text=step_text)
+        log_placeholder.code("\n".join(log_lines))
 
-    st.session_state.project_data = {
-        "name": meta.get("name", pdir.name),
-        "poles": merged,
-        "pdf_path": str(pdf_path) if pdf_path.exists() else None,
-        "dxf_path": str(dxf_path) if dxf_path.exists() else None,
-        "project_dir": str(pdir),
-    }
-    st.session_state.last_project_processing_log = None
-    st.session_state.project_name = meta.get("name", "")
-    st.session_state.current_step = "project_overview"
-    st.rerun()
+    try:
+        _show_action_hint("Загрузка проекта...", "Подготавливаем данные проекта и восстанавливаем состояние.")
+        log_step("Чтение сохранённых артефактов...", 20)
+        pdf_data = _load_parsed_project_artifacts(pdir) or []
+
+        if not pdf_data and pdf_path.exists():
+            log_step("Артефакты не найдены. Fallback-парсинг PDF...", 45)
+            pdf_data = parse_pdf_project(str(pdf_path), get_cfg())
+        else:
+            log_step("Артефакты проекта загружены.", 45)
+
+        if dxf_path.exists():
+            log_step("Парсинг DXF проекта...", 65)
+            dxf_data = parse_dxf_project(str(dxf_path), get_cfg())
+        else:
+            dxf_data = None
+            log_step("DXF не найден. Пропуск этапа DXF.", 65)
+
+        log_step("Объединение данных проекта...", 85)
+        merged = merge_project_data(pdf_data, dxf_data)
+
+        st.session_state.project_data = {
+            "name": meta.get("name", pdir.name),
+            "poles": merged,
+            "pdf_path": str(pdf_path) if pdf_path.exists() else None,
+            "dxf_path": str(dxf_path) if dxf_path.exists() else None,
+            "project_dir": str(pdir),
+        }
+        st.session_state.last_project_processing_log = {
+            "status": "OK",
+            "elapsed_s": elapsed_s(),
+            "project_name": meta.get("name", pdir.name),
+            "lines": log_lines,
+        }
+        st.session_state.project_name = meta.get("name", "")
+        st.session_state.current_step = "project_overview"
+        log_step(f"Проект открыт. Опор загружено: {len(merged)}.", 100)
+        st.rerun()
+    except Exception as e:
+        fail_line = f"[+{elapsed_s():.1f}s] [100%] FAILED: {e}"
+        log_lines.append(fail_line)
+        progress.progress(100, text="Открытие проекта завершилось с ошибкой")
+        log_placeholder.code("\n".join(log_lines))
+        st.error(f"Ошибка открытия проекта: {e}")
+        import traceback
+        st.expander("Подробности ошибки").code(traceback.format_exc())
 
 
 # ---------------------------------------------------------------------------
@@ -489,9 +666,40 @@ def render_project_overview():
         st.session_state.project_data["poles"] = edited.to_dict("records")
 
     st.divider()
-    if st.button("📏 Перейти к загрузке замеров", type="primary"):
-        st.session_state.current_step = "measurements"
-        st.rerun()
+    col_actions_left, col_actions_right = st.columns([1, 1])
+    with col_actions_left:
+        if st.button("Перепарсить PDF заново", use_container_width=True):
+            from project_parser import parse_dxf_project, parse_pdf_project, parse_pdf_with_llm, merge_project_data
+
+            pdf_path = Path(str(pdata.get("pdf_path") or ""))
+            project_dir = Path(str(pdata.get("project_dir") or ""))
+            if not pdf_path.exists():
+                st.error("Файл project.pdf не найден. Перепарсить невозможно.")
+            else:
+                _show_action_hint("Перепарсинг PDF...", "Выполняется LLM-парсинг и обновление данных проекта.")
+                with st.spinner("Парсинг PDF через Gemini..."):
+                    try:
+                        llm_payload = parse_pdf_with_llm(str(pdf_path), project_dir.name)
+                        refreshed_pdf_data = llm_payload.get("poles", []) if llm_payload else []
+                        if not refreshed_pdf_data:
+                            refreshed_pdf_data = parse_pdf_project(str(pdf_path), get_cfg())
+                        dxf_path = Path(str(pdata.get("dxf_path") or ""))
+                        dxf_data = (
+                            parse_dxf_project(str(dxf_path), get_cfg())
+                            if dxf_path.exists()
+                            else None
+                        )
+                        merged = merge_project_data(refreshed_pdf_data, dxf_data)
+                        st.session_state.project_data["poles"] = merged
+                        st.success("Перепарсинг завершён, данные проекта обновлены.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Ошибка перепарсинга: {e}")
+    with col_actions_right:
+        if st.button("📏 Перейти к загрузке замеров", type="primary", use_container_width=True):
+            st.session_state.current_step = "measurements"
+            st.rerun()
+
 
 
 # ---------------------------------------------------------------------------
@@ -565,6 +773,7 @@ def _process_measurements(files, pdata):
     if uploaded_count > max_files:
         st.warning(f"Будут обработаны первые {max_files} файлов из {uploaded_count}.")
 
+    _show_action_hint("Обработка замеров...", "Анализируем файлы и считаем отклонения. Пожалуйста, подождите.")
     progress = st.progress(0, text="Парсинг файлов замеров...")
     total = len(files)
 
@@ -746,6 +955,7 @@ def _generate_documents(results, pdata, cfg, gen_pdf, gen_dxf, template_dxf):
     from pdf_exporter import generate_pole_pdf, generate_summary_excel, create_zip_archive
 
     try:
+        _show_action_hint("Генерация документов...", "Формируем файлы и архив. Это может занять некоторое время.")
         progress = st.progress(0, text="Подготовка...")
         total = len(results)
         pdf_buffers = []
