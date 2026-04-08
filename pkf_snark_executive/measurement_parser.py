@@ -4,8 +4,21 @@
 Поддерживаемые форматы:
 - TXT: CSV без заголовка; по умолчанию «Имя,X,Y,Z», опционально «Имя,Y,X,Z»
   (см. measurement_txt_coord_order / настройки замеров)
-- DXF: POINT + TEXT; либо INSERT блока (напр. Measured) + TEXT на слое с номером точки (Nomer)
-- XML: Leica/Trimble форматы
+- DXF: расширенный парсинг геодезических файлов с поддержкой:
+  1) INSERT блока замера (обычно «Measured») с координатой в точке вставки;
+  2) классических POINT;
+  3) подписей TEXT и MTEXT.
+- XML: Leica/Trimble форматы.
+
+Новая логика DXF (для формата наподобие 176-171.dxf):
+- Собираем геометрию из INSERT и POINT modelspace;
+- Собираем подписи из TEXT/MTEXT;
+- Нормализуем подпись (игнор регистра/лишних пробелов);
+- Извлекаем номер опоры из строки и приводим к виду N###
+  (пример: N171, n 171, 171.18 -> N171);
+- Для каждой точки ищем ближайшую подпись в радиусе 5 м;
+- Логируем детальную статистику (кол-во сущностей, распознанных подписей,
+  сопоставленных точек и уникальных опор).
 
 Привязка точек к опорам:
 - По расстоянию в плане (порог 2 м по умолчанию)
@@ -27,6 +40,187 @@ if TYPE_CHECKING:
     from config import AppConfig
 
 logger = logging.getLogger(__name__)
+_DXF_LABEL_RADIUS_M = 5.0
+_DXF_POLE_RE_PREF_N = re.compile(r'^N\s*(\d{1,4})$', re.IGNORECASE)
+_DXF_POLE_RE_NUMERIC = re.compile(r'^(\d{3,4})(?:\.(\d+))?$')
+
+
+def debug_parse_measurements_dxf(
+    dxf_path: str,
+    *,
+    block_name: str = "Measured",
+    preferred_label_layer: str = "Nomer",
+    search_radius_m: float = _DXF_LABEL_RADIUS_M,
+) -> dict[str, Any]:
+    """
+    Диагностический отчёт по DXF-замерам.
+
+    Не меняет рабочую логику, но возвращает структуру, которая помогает понять:
+    - какие подписи реально присутствуют в файле,
+    - сколько точек не удалось сопоставить в текущем радиусе,
+    - какие именно опоры были распознаны.
+    """
+    report: dict[str, Any] = {
+        "dxf_path": dxf_path,
+        "block_name": block_name,
+        "preferred_label_layer": preferred_label_layer,
+        "search_radius_m": float(search_radius_m),
+        "insert_count": 0,
+        "point_count": 0,
+        "text_count": 0,
+        "mtext_count": 0,
+        "normalized_label_count": 0,
+        "normalized_labels_unique": [],
+        "matched_points_count": 0,
+        "matched_points_by_pole": {},
+        "unmatched_points_count": 0,
+        "unmatched_points_preview": [],
+        "raw_label_samples": [],
+        "warning": "",
+    }
+
+    try:
+        doc = ezdxf.readfile(dxf_path)
+        msp = doc.modelspace()
+    except Exception as e:
+        report["warning"] = f"DXF read failed: {e}"
+        return report
+
+    def _clean_text(raw: str) -> str:
+        return re.sub(r"\s+", " ", (raw or "").strip())
+
+    def _normalize_pole_name(raw: str) -> str | None:
+        text = _clean_text(raw).upper()
+        if not text:
+            return None
+        compact = re.sub(r"\s+", "", text)
+        m_n = _DXF_POLE_RE_PREF_N.match(compact)
+        if m_n:
+            return f"N{int(m_n.group(1))}"
+        m_num = _DXF_POLE_RE_NUMERIC.match(compact)
+        if m_num:
+            return f"N{int(m_num.group(1))}"
+        return None
+
+    inserts: list[dict[str, Any]] = []
+    points: list[dict[str, Any]] = []
+    labels: list[dict[str, Any]] = []
+
+    for ent in msp.query("INSERT"):
+        try:
+            if str(getattr(ent.dxf, "name", "") or "").lower() != block_name.lower():
+                continue
+            ins = ent.dxf.insert
+            inserts.append(
+                {
+                    "x": float(ins.x),
+                    "y": float(ins.y),
+                    "z": float(ins.z),
+                    "layer": str(getattr(ent.dxf, "layer", "") or ""),
+                }
+            )
+        except Exception:
+            continue
+
+    for ent in msp.query("POINT"):
+        try:
+            loc = ent.dxf.location
+            points.append(
+                {
+                    "x": float(loc.x),
+                    "y": float(loc.y),
+                    "z": float(loc.z),
+                    "layer": str(getattr(ent.dxf, "layer", "") or ""),
+                }
+            )
+        except Exception:
+            continue
+
+    for ent in msp.query("TEXT"):
+        try:
+            txt = _clean_text(str(getattr(ent.dxf, "text", "") or ""))
+            pos = ent.dxf.insert
+            labels.append(
+                {
+                    "raw_text": txt,
+                    "name": _normalize_pole_name(txt),
+                    "x": float(pos.x),
+                    "y": float(pos.y),
+                    "z": float(pos.z),
+                    "layer": str(getattr(ent.dxf, "layer", "") or ""),
+                    "kind": "TEXT",
+                }
+            )
+        except Exception:
+            continue
+
+    for ent in msp.query("MTEXT"):
+        try:
+            txt = _clean_text(ent.plain_text())
+            pos = ent.dxf.insert
+            labels.append(
+                {
+                    "raw_text": txt,
+                    "name": _normalize_pole_name(txt),
+                    "x": float(pos.x),
+                    "y": float(pos.y),
+                    "z": float(pos.z),
+                    "layer": str(getattr(ent.dxf, "layer", "") or ""),
+                    "kind": "MTEXT",
+                }
+            )
+        except Exception:
+            continue
+
+    report["insert_count"] = len(inserts)
+    report["point_count"] = len(points)
+    report["text_count"] = sum(1 for l in labels if l["kind"] == "TEXT")
+    report["mtext_count"] = sum(1 for l in labels if l["kind"] == "MTEXT")
+    report["raw_label_samples"] = [l["raw_text"] for l in labels[:30]]
+
+    valid_all = [l for l in labels if l["name"]]
+    valid_layer = [l for l in valid_all if str(l["layer"]).lower() == preferred_label_layer.lower()]
+    valid = valid_layer or valid_all
+    unique_norm = sorted({str(l["name"]) for l in valid})
+    report["normalized_label_count"] = len(valid)
+    report["normalized_labels_unique"] = unique_norm
+
+    geom = inserts if inserts else points
+    matched_by_pole: dict[str, int] = {}
+    unmatched: list[dict[str, Any]] = []
+    for g in geom:
+        gp = Point3D(g["x"], g["y"], g["z"])
+        best_name = None
+        best_dist = float("inf")
+        for lbl in valid:
+            lp = Point3D(lbl["x"], lbl["y"], lbl["z"])
+            d = distance_2d(gp, lp)
+            if d <= search_radius_m and d < best_dist:
+                best_dist = d
+                best_name = str(lbl["name"])
+        if best_name:
+            matched_by_pole[best_name] = matched_by_pole.get(best_name, 0) + 1
+        else:
+            unmatched.append(
+                {
+                    "x": round(float(g["x"]), 3),
+                    "y": round(float(g["y"]), 3),
+                    "z": round(float(g["z"]), 3),
+                    "layer": str(g.get("layer", "")),
+                }
+            )
+
+    report["matched_points_by_pole"] = dict(sorted(matched_by_pole.items()))
+    report["matched_points_count"] = sum(matched_by_pole.values())
+    report["unmatched_points_count"] = len(unmatched)
+    report["unmatched_points_preview"] = unmatched[:20]
+    if len(unique_norm) <= 2:
+        report["warning"] = (
+            "В DXF распознано мало уникальных подписей опор. "
+            "Проверьте, действительно ли в файле есть N172..N178 "
+            "или они расположены в другом слое/формате подписи."
+        )
+    return report
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +253,236 @@ def parse_measurement_file(
     else:
         logger.warning("Неизвестный формат файла: %s", ext)
         return []
+
+
+def parse_measurements_txt(file_path: str) -> list[dict[str, Any]]:
+    """Совместимый wrapper: TXT-парсинг без изменения старой логики."""
+    return parse_txt_measurements(file_path)
+
+
+def parse_measurements_dxf(
+    dxf_path: str,
+    *,
+    block_name: str = "Measured",
+    preferred_label_layer: str = "Nomer",
+    search_radius_m: float = _DXF_LABEL_RADIUS_M,
+    include_unlabeled: bool = False,
+    allow_raw_label_fallback: bool = False,
+    prioritize_insert: bool = True,
+) -> list[dict[str, Any]]:
+    """
+    Надёжный DXF-парсинг для геодезических замеров.
+
+    Возвращает список точек в формате:
+      [{'name': 'N171', 'x': ..., 'y': ..., 'z': ..., 'layer': ...}, ...]
+    """
+    points: list[dict[str, Any]] = []
+    try:
+        doc = ezdxf.readfile(dxf_path)
+    except Exception as e:
+        logger.error("DXF: ошибка чтения %s: %s", dxf_path, e)
+        return points
+
+    try:
+        msp = doc.modelspace()
+    except Exception as e:
+        logger.error("DXF: не удалось получить modelspace %s: %s", dxf_path, e)
+        return points
+
+    insert_geometry: list[dict[str, Any]] = []
+    point_geometry: list[dict[str, Any]] = []
+    label_candidates: list[dict[str, Any]] = []
+
+    def _clean_text(raw: str) -> str:
+        return re.sub(r"\s+", " ", (raw or "").strip())
+
+    def _normalize_pole_name(raw: str) -> str | None:
+        text = _clean_text(raw).upper()
+        if not text:
+            return None
+        compact = re.sub(r"\s+", "", text)
+
+        m_n = _DXF_POLE_RE_PREF_N.match(compact)
+        if m_n:
+            return f"N{int(m_n.group(1))}"
+
+        m_num = _DXF_POLE_RE_NUMERIC.match(compact)
+        if m_num:
+            # 171.18 -> N171, 176 -> N176
+            return f"N{int(m_num.group(1))}"
+        return None
+
+    # 1) Геометрия: INSERT блока замера + POINT
+    for ent in msp.query("INSERT"):
+        try:
+            name = str(getattr(ent.dxf, "name", "") or "")
+            if name.lower() != block_name.lower():
+                continue
+            ins = ent.dxf.insert
+            insert_geometry.append(
+                {
+                    "kind": "INSERT",
+                    "x": float(ins.x),
+                    "y": float(ins.y),
+                    "z": float(ins.z),
+                    "layer": str(getattr(ent.dxf, "layer", "") or ""),
+                }
+            )
+        except Exception:
+            continue
+
+    for ent in msp.query("POINT"):
+        try:
+            loc = ent.dxf.location
+            point_geometry.append(
+                {
+                    "kind": "POINT",
+                    "x": float(loc.x),
+                    "y": float(loc.y),
+                    "z": float(loc.z),
+                    "layer": str(getattr(ent.dxf, "layer", "") or ""),
+                }
+            )
+        except Exception:
+            continue
+
+    # 2) Подписи: TEXT + MTEXT
+    for ent in msp.query("TEXT"):
+        try:
+            txt = _clean_text(str(getattr(ent.dxf, "text", "") or ""))
+            pos = ent.dxf.insert
+            label_candidates.append(
+                {
+                    "raw_text": txt,
+                    "name": _normalize_pole_name(txt),
+                    "x": float(pos.x),
+                    "y": float(pos.y),
+                    "z": float(pos.z),
+                    "layer": str(getattr(ent.dxf, "layer", "") or ""),
+                }
+            )
+        except Exception:
+            continue
+
+    for ent in msp.query("MTEXT"):
+        try:
+            txt = _clean_text(ent.plain_text())
+            pos = ent.dxf.insert
+            label_candidates.append(
+                {
+                    "raw_text": txt,
+                    "name": _normalize_pole_name(txt),
+                    "x": float(pos.x),
+                    "y": float(pos.y),
+                    "z": float(pos.z),
+                    "layer": str(getattr(ent.dxf, "layer", "") or ""),
+                }
+            )
+        except Exception:
+            continue
+
+    valid_labels_all = [l for l in label_candidates if l["name"]]
+    valid_labels = [
+        l for l in valid_labels_all
+        if str(l.get("layer", "")).lower() == preferred_label_layer.lower()
+    ]
+    if not valid_labels:
+        valid_labels = valid_labels_all
+
+    if prioritize_insert and insert_geometry:
+        geometry = insert_geometry
+    else:
+        geometry = insert_geometry + point_geometry
+
+    logger.info(
+        (
+            "DXF %s: insert=%d, point=%d, used_geometry=%d, labels=%d (TEXT+MTEXT), "
+            "valid_pole_labels=%d, radius=%.3f m"
+        ),
+        dxf_path,
+        len(insert_geometry),
+        len(point_geometry),
+        len(geometry),
+        len(label_candidates),
+        len(valid_labels_all),
+        float(search_radius_m),
+    )
+
+    # 3) Сопоставление геометрии с ближайшей валидной подписью в радиусе 5 м
+    for g in geometry:
+        gp = Point3D(g["x"], g["y"], g["z"])
+        best_name = None
+        best_dist = float("inf")
+        for lbl in valid_labels:
+            lp = Point3D(lbl["x"], lbl["y"], lbl["z"])
+            d = distance_2d(gp, lp)
+            if d <= search_radius_m and d < best_dist:
+                best_dist = d
+                best_name = lbl["name"]
+        if not best_name:
+            if include_unlabeled:
+                best_name = f"P_{g['x']:.3f}_{g['y']:.3f}"
+            else:
+                continue
+        if allow_raw_label_fallback and best_name.startswith("P_"):
+            # Ищем ближайший сырой текст, даже если не распознан как N###.
+            best_raw = ""
+            best_raw_dist = float("inf")
+            for lbl in label_candidates:
+                lp = Point3D(lbl["x"], lbl["y"], lbl["z"])
+                d = distance_2d(gp, lp)
+                if d <= search_radius_m and d < best_raw_dist:
+                    best_raw_dist = d
+                    best_raw = str(lbl.get("raw_text", "") or "")
+            cleaned_raw = _clean_text(best_raw)
+            if cleaned_raw:
+                best_name = cleaned_raw
+        points.append(
+            {
+                "name": best_name,
+                "x": g["x"],
+                "y": g["y"],
+                "z": g["z"],
+                "layer": g["layer"],
+            }
+        )
+
+    unique_poles = sorted({p["name"] for p in points})
+    poles_preview = unique_poles[:20]
+    logger.info(
+        "DXF %s: matched_points=%d, unique_poles=%d, poles_preview=%s",
+        dxf_path,
+        len(points),
+        len(unique_poles),
+        poles_preview if poles_preview else "none",
+    )
+    if len(unique_poles) <= 2:
+        logger.warning(
+            (
+                "DXF matched low unique pole count (%d). "
+                "Run debug_parse_measurements_dxf(...) for detailed report."
+            ),
+            len(unique_poles),
+        )
+    return points
+
+
+def parse_measurements(file_path: str) -> list[dict[str, Any]]:
+    """
+    Автоопределение формата файла:
+    - .dxf -> parse_measurements_dxf
+    - .txt -> parse_measurements_txt
+    - .xml -> parse_xml_measurements
+    """
+    ext = Path(file_path).suffix.lower()
+    if ext == ".dxf":
+        return parse_measurements_dxf(file_path)
+    if ext == ".txt":
+        return parse_measurements_txt(file_path)
+    if ext == ".xml":
+        return parse_xml_measurements(file_path)
+    logger.warning("parse_measurements: неизвестный формат %s", ext)
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +641,7 @@ def parse_dxf_measurements(
     file_path: str,
     cfg: "AppConfig | None" = None,
 ) -> list[dict[str, Any]]:
-    """Парсит DXF-файл замеров: INSERT+подпись (приоритет) или POINT + TEXT."""
+    """Совместимый API: DXF -> общий парсер + преобразование в внутренний формат."""
     from config import AppConfig
 
     c = cfg or AppConfig()
@@ -225,53 +649,35 @@ def parse_dxf_measurements(
     label_layer = getattr(c, "dxf_measurement_label_layer", "Nomer") or "Nomer"
     match_r = float(getattr(c, "dxf_measurement_label_radius_m", 0.15) or 0.15)
 
+    raw_points = parse_measurements_dxf(
+        file_path,
+        block_name=block_name,
+        preferred_label_layer=label_layer,
+        search_radius_m=match_r,
+        include_unlabeled=True,
+        allow_raw_label_fallback=True,
+        prioritize_insert=True,
+    )
     points: list[dict[str, Any]] = []
+    for rp in raw_points:
+        name = str(rp.get("name", "") or "").strip()
+        x = float(rp.get("x", 0.0) or 0.0)
+        y = float(rp.get("y", 0.0) or 0.0)
+        z = float(rp.get("z", 0.0) or 0.0)
+        point = _classify_point(name, x, y, z)
+        # Для имени N171 сохраняем совместимую привязку к проектной опоре 171.
+        m = re.match(r'^[Nn]\s*(\d+)$', name)
+        if m:
+            point["pole_id"] = m.group(1)
+        if "layer" in rp:
+            point["layer"] = rp["layer"]
+        points.append(point)
 
-    try:
-        doc = ezdxf.readfile(file_path)
-    except Exception as e:
-        logger.error("Ошибка чтения DXF замеров: %s", e)
-        return points
-
-    msp = doc.modelspace()
-
-    measured = _parse_dxf_measured_inserts(msp, block_name, label_layer, match_r)
-    if measured:
-        logger.info(
-            "DXF: INSERT «%s» + слой «%s»: %d точек из %s",
-            block_name,
-            label_layer,
-            len(measured),
-            file_path,
-        )
-        return measured
-
-    # Fallback: классическая схема POINT + TEXT
-    dxf_points: list[Point3D] = []
-    for entity in msp.query("POINT"):
-        loc = entity.dxf.location
-        dxf_points.append(Point3D(loc.x, loc.y, loc.z))
-
-    texts: list[tuple[Point3D, str]] = []
-    for entity in msp.query("TEXT"):
-        pos = entity.dxf.insert
-        text = entity.dxf.text.strip()
-        if text:
-            texts.append((Point3D(pos.x, pos.y, pos.z), text))
-
-    for pt in dxf_points:
-        best_dist = float("inf")
-        best_name = ""
-        for tpt, tname in texts:
-            d = distance_2d(pt, tpt)
-            if d < best_dist and d < 3.0:
-                best_dist = d
-                best_name = tname
-
-        name = best_name or f"P_{pt.x:.1f}_{pt.y:.1f}"
-        points.append(_classify_point(name, pt.x, pt.y, pt.z))
-
-    logger.info("DXF замеры (POINT+TEXT): прочитано %d точек из %s", len(points), file_path)
+    logger.info(
+        "DXF замеры: преобразовано %d точек в совместимый формат (%s)",
+        len(points),
+        file_path,
+    )
     return points
 
 
