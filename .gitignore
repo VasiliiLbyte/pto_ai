@@ -6,3 +6,8 @@ Thumbs.db
 *.pem
 *.key
 
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyd
+
